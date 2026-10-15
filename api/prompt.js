@@ -16,6 +16,88 @@ export default async function handler(req, res) {
 
   const mode = body.mode || 'prompt';
 
+  // ============================================
+  // TRANSCRIBE MODE — Groq Whisper
+  // ============================================
+  if (mode === 'transcribe') {
+    const audioBase64 = body.audioBase64;
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'Missing audio data' });
+    }
+
+    try {
+      // Convert base64 to buffer
+      const buffer = Buffer.from(audioBase64, 'base64');
+
+      // Build multipart form data for Groq
+      const boundary = '----ReverieBoundary' + Date.now();
+      const filename = 'audio.m4a';
+
+      const parts = [];
+
+      // file part
+      parts.push(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: audio/m4a\r\n\r\n`
+      );
+      const fileHeader = Buffer.from(parts.join(''), 'utf8');
+      const fileFooter = Buffer.from('\r\n', 'utf8');
+
+      // model part
+      const modelPart = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-large-v3\r\n`,
+        'utf8'
+      );
+
+      // language hint
+      const langPart = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n`,
+        'utf8'
+      );
+
+      const closing = Buffer.from(`--${boundary}--\r\n`, 'utf8');
+
+      const finalBody = Buffer.concat([
+        fileHeader,
+        buffer,
+        fileFooter,
+        modelPart,
+        langPart,
+        closing,
+      ]);
+
+      const groqRes = await fetch(
+        'https://api.groq.com/openai/v1/audio/transcriptions',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${GROQ_KEY}`,
+            'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          },
+          body: finalBody,
+        }
+      );
+
+      const data = await groqRes.json();
+
+      if (!groqRes.ok) {
+        return res.status(500).json({
+          error: 'Transcription failed',
+          details: data,
+        });
+      }
+
+      const text = (data.text || '').trim();
+      return res.status(200).json({ success: true, text });
+    } catch (e) {
+      return res
+        .status(500)
+        .json({ error: 'Server error', details: e.message });
+    }
+  }
+
+  // ============================================
+  // PROMPT / REFLECTION MODES
+  // ============================================
   let systemPrompt = '';
   let userPrompt = '';
 
@@ -26,24 +108,21 @@ export default async function handler(req, res) {
     systemPrompt = `You are a thoughtful journaling companion for REVERIE. Generate one unique reflective journaling prompt.
 
 Rules:
-- Reply with ONLY the prompt — no quotes, no prefix, no explanation
+- Reply with ONLY the prompt — no quotes, no prefix
 - 1 sentence, max 15 words
 - Warm, gentle, personal tone
 - Avoid clichés like "How was your day"
 - Vary topics: gratitude, memories, relationships, self-discovery, small moments, future hopes, challenges
-- Never repeat a prompt from the recent list
-
-Examples of the style:
-- What small moment today made you pause and smile?
-- Who do you wish you could talk to right now, and what would you say?
-- What's something you've been carrying that you could set down?`;
+- Never repeat a prompt from the recent list`;
 
     userPrompt = `Write one new prompt.`;
     if (recentMoods.length > 0) {
       userPrompt += ` Recent moods (0=great, 4=sad): ${recentMoods.join(', ')}.`;
     }
     if (recentPrompts.length > 0) {
-      userPrompt += ` Do not repeat these:\n- ${recentPrompts.slice(0, 8).join('\n- ')}`;
+      userPrompt += ` Do not repeat these:\n- ${recentPrompts
+        .slice(0, 8)
+        .join('\n- ')}`;
     }
   } else if (mode === 'reflection') {
     const entryText = (body.entryText || '').substring(0, 500);
@@ -61,11 +140,7 @@ Rules:
 - Warm, encouraging, non-judgmental
 - Notice the emotion or something worth celebrating
 - End with one gentle follow-up question
-- Speak directly to the writer using "you"
-
-Examples of the style:
-- "Today you felt the warmth of connection. What made that moment feel so meaningful?
-- "There's quiet strength in how you handled today. What helped you stay grounded?"`;
+- Speak directly to the writer using "you"`;
 
     userPrompt = `Mood: ${moodLabel}\n\nEntry: "${entryText}"\n\nWrite the reflection.`;
   } else {
@@ -93,19 +168,21 @@ Examples of the style:
         max_tokens: 600,
       };
 
-      // Reasoning models — keep it minimal so tokens go to the answer
       if (m.reasoning) {
         reqBody.reasoning_effort = 'low';
       }
 
-      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${GROQ_KEY}`,
-        },
-        body: JSON.stringify(reqBody),
-      });
+      const groqRes = await fetch(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${GROQ_KEY}`,
+          },
+          body: JSON.stringify(reqBody),
+        }
+      );
 
       const data = await groqRes.json();
 
@@ -120,11 +197,11 @@ Examples of the style:
 
       let reply = data.choices?.[0]?.message?.content?.trim() || '';
 
-      // Fallback: some reasoning models put answer in reasoning field
       if (!reply && data.choices?.[0]?.message?.reasoning) {
         const r = data.choices[0].message.reasoning;
-        // Take the last meaningful sentence
-        const sentences = r.split(/[.!?]\s+/).filter((s) => s.trim().length > 10);
+        const sentences = r
+          .split(/[.!?]\s+/)
+          .filter((s) => s.trim().length > 10);
         if (sentences.length > 0) {
           reply = sentences[sentences.length - 1].trim();
           if (!/[.!?]$/.test(reply)) reply += '?';
@@ -150,7 +227,11 @@ Examples of the style:
         });
       }
 
-      attempts.push({ model: m.id, status: 200, error: 'Empty after cleaning' });
+      attempts.push({
+        model: m.id,
+        status: 200,
+        error: 'Empty after cleaning',
+      });
     } catch (e) {
       attempts.push({ model: m.id, error: e.message });
     }
